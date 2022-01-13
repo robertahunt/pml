@@ -1,0 +1,24 @@
+version: '3.7'
+services:
+  stwo:
+    # Note that the path of the Dockerfile and context is relative to the *primary*
+    # docker-compose.yml file (the first in the devcontainer.json "dockerComposeFile"
+    # array). The sample below assumes your primary file is in the root of your project.
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+    volumes:
+      - .:/home/ngw861/pml:cached
+      - ~/.ssh/id_github:/home/rob/.ssh/id_rsa
+    command: sh -c "while sleep 1000; do :; done "
+    runtime: nvidia
+    environment:
+      - TZ=Europe/Copenhagen
+      - DEBIAN_FRONTEND=noninteractive
+    shm_size: '1gb' # docker was running out of shared memory when running, maybe
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-modeset:/dev/nvidia-modeset
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
