@@ -70,7 +70,7 @@ RUN python3.6 -m pip install black pytest gitpython pandas types-six types-reque
 RUN python3.6 -m pip install opencv-python albumentations bokeh scikit-learn plotly
 # used to calculate the s-dbw cluster similarity metric
 RUN python3.6 -m pip install s-dbw 
-RUN python3.6 -m pip install biopython
+RUN python3.6 -m pip install biopython seaborn
 
 RUN python3.6 -m pip freeze > /home/rob/requirements.txt
 

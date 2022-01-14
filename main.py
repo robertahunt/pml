@@ -16,329 +16,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Sequential
 
+from scipy.stats import spearmanr
+
+from models import deepSequenceSimple
+from utils import (
+    get_data,
+    plot_latent,
+    plot_losses,
+    train,
+    validate,
+    vae_loss,
+    LossAccumulator,
+    aa1_to_index,
+)
+
 # FASTA parser requires Biopython
 
 BATCH_SIZE = 16
-MAX_NUM_EPOCHS = 200
+MAX_NUM_EPOCHS = 25
 EARLY_STOPPING = 20
 DEBUG_MODE = False
 PRINT_FREQ = 1500
-
-# Mapping from amino acids to integers
-aa1_to_index = {
-    "A": 0,
-    "C": 1,
-    "D": 2,
-    "E": 3,
-    "F": 4,
-    "G": 5,
-    "H": 6,
-    "I": 7,
-    "K": 8,
-    "L": 9,
-    "M": 10,
-    "N": 11,
-    "P": 12,
-    "Q": 13,
-    "R": 14,
-    "S": 15,
-    "T": 16,
-    "V": 17,
-    "W": 18,
-    "Y": 19,
-    "X": 20,
-    "Z": 21,
-    "-": 22,
-}
-aa1 = "ACDEFGHIKLMNPQRSTVWYXZ-"
-
-phyla = [
-    "Acidobacteria",
-    "Actinobacteria",
-    "Bacteroidetes",
-    "Chloroflexi",
-    "Cyanobacteria",
-    "Deinococcus-Thermus",
-    "Firmicutes",
-    "Fusobacteria",
-    "Proteobacteria",
-    "Other",
-]
-
-
-def get_data(data_filename, calc_weights=False, weights_similarity_threshold=0.8):
-    """Create dataset from FASTA filename"""
-    ids = []
-    labels = []
-    seqs = []
-    label_re = re.compile(r"\[([^\]]*)\]")
-    for record in SeqIO.parse(data_filename, "fasta"):
-        ids.append(record.id)
-        seqs.append(
-            np.array(
-                [aa1_to_index[aa] for aa in str(record.seq).upper().replace(".", "-")]
-            )
-        )
-
-        label = label_re.search(record.description).group(1)
-        # Only use most common classes
-        if label not in phyla:
-            label = "Other"
-        labels.append(label)
-
-    seqs = F.one_hot(torch.from_numpy(np.vstack(seqs))).float()
-
-    labels = np.array(labels)
-
-    phyla_lookup_table, phyla_idx = np.unique(labels, return_inverse=True)
-    phyla_map = {k: v for k, v in zip(phyla_idx, labels)}
-
-    train_seqs, valid_seqs, train_phyla, valid_phyla = train_test_split(
-        seqs, torch.from_numpy(phyla_idx), train_size=0.7, stratify=phyla_idx
-    )
-    train_dataset = torch.utils.data.TensorDataset(*[train_seqs, train_phyla])
-    valid_dataset = torch.utils.data.TensorDataset(*[valid_seqs, valid_phyla])
-
-    weights = None
-    if calc_weights is not False:
-
-        # Experiencing memory issues on colab for this code because pytorch doesn't
-        # allow one_hot directly to bool. Splitting in two and then merging.
-        # one_hot = F.one_hot(seqs.long()).to('cuda' if torch.cuda.is_available() else 'cpu')
-        one_hot1 = F.one_hot(seqs[: len(seqs) // 2].long()).bool()
-        one_hot2 = F.one_hot(seqs[len(seqs) // 2 :].long()).bool()
-        one_hot = torch.cat([one_hot1, one_hot2]).to(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-        assert len(seqs) == len(one_hot)
-        del one_hot1
-        del one_hot2
-        one_hot[seqs > 19] = 0
-        flat_one_hot = one_hot.flatten(1)
-
-        weights = []
-        weight_batch_size = 1000
-        flat_one_hot = flat_one_hot.float()
-        for i in range(seqs.size(0) // weight_batch_size + 1):
-            x = flat_one_hot[i * weight_batch_size : (i + 1) * weight_batch_size]
-            similarities = torch.mm(x, flat_one_hot.T)
-            lengths = (
-                (seqs[i * weight_batch_size : (i + 1) * weight_batch_size] <= 19)
-                .sum(1)
-                .unsqueeze(-1)
-                .to("cuda" if torch.cuda.is_available() else "cpu")
-            )
-            w = (
-                1.0
-                / (similarities / lengths)
-                .gt(weights_similarity_threshold)
-                .sum(1)
-                .float()
-            )
-            weights.append(w)
-
-        weights = torch.cat(weights)
-        neff = weights.sum()
-
-    return train_dataset, valid_dataset, weights, phyla_map
-
-
-class deepSequenceSimple(nn.Module):
-    def __init__(
-        self,
-        encoder_arch=[263 * 23, 1500, 1500],
-        decoder_arch=[100, 500, 263 * 23],
-        n_latent=2,
-        activation_function="ReLU",
-        gate_function="Sigmoid",
-        enable_bn=True,
-    ):
-
-        super(deepSequenceSimple, self).__init__()
-
-        # VGG without Bn as AutoEncoder is hard to train
-        self.encoder = Encoder(
-            arch=encoder_arch,
-            n_latent=n_latent,
-            enable_bn=enable_bn,
-            activation_function=activation_function,
-        )
-        self.decoder = Decoder(
-            arch=decoder_arch,
-            n_latent=n_latent,
-            enable_bn=enable_bn,
-            activation_function=activation_function,
-            gate_function=gate_function,
-        )
-
-    def reparameterize(self, z_mu, z_logvar):
-        z_std = torch.exp(0.5 * z_logvar)
-        eps_dist = torch.distributions.normal.Normal(0, 1)
-        return z_mu + z_std * eps_dist.sample(z_mu.shape).cuda()
-
-    def forward(self, inputs):
-        x = inputs[0].cuda()
-        orig_shape = x.shape
-        batch_size = x.shape[0]
-        x = x.view(batch_size, -1)
-
-        z_mu, z_logvar = self.encoder(x.cuda())
-        z = self.reparameterize(z_mu, z_logvar)
-
-        x_hat = self.decoder(z)
-        x_hat = x_hat.view(orig_shape)
-        return x_hat, z_mu, z_logvar
-
-
-class Encoder(nn.Module):
-    def __init__(
-        self,
-        arch=[263 * 23, 1500, 1500],
-        n_latent=2,
-        enable_bn=True,
-        activation_function="relu",
-    ):
-
-        super(Encoder, self).__init__()
-
-        exec(f"self.af = nn.{activation_function}")
-
-        layers = []
-        for i in range(len(arch[:-1])):
-            _in, _out = arch[i], arch[i + 1]
-            layers += [nn.Linear(in_features=_in, out_features=_out)]
-            if enable_bn:
-                layers += [nn.BatchNorm1d(_out)]
-            layers += [self.af()]
-
-        self.net = Sequential(*layers)
-
-        self.l_mu = nn.Linear(in_features=arch[-1], out_features=n_latent)
-        self.l_logsigma = nn.Linear(in_features=arch[-1], out_features=n_latent)
-        print("Initialized Encoder: %s" % self)
-
-    def forward(self, x):
-        x = self.net(x)
-        z_mu = self.l_mu(x)
-        z_logsigma = self.l_logsigma(x)
-        return z_mu, z_logsigma
-
-
-class Decoder(nn.Module):
-    def __init__(
-        self,
-        arch=[100, 500, 263 * 23],
-        n_latent=2,
-        enable_bn=True,
-        activation_function="ReLU",
-        gate_function="Sigmoid",
-    ):
-
-        super(Decoder, self).__init__()
-
-        exec(f"self.af = nn.{activation_function}")
-        exec(f"self.gate_function = nn.{gate_function}")
-        arch = [n_latent] + arch
-        layers = []
-        for i in range(len(arch[:-1])):
-            _in, _out = arch[i], arch[i + 1]
-            if i != 0:
-                layers += [self.af()]
-            if enable_bn:
-                layers += [nn.BatchNorm1d(_in)]
-            layers += [nn.Linear(in_features=_in, out_features=_out)]
-
-        layers += [self.gate_function()]
-
-        self.net = Sequential(*layers)
-        print("Initialized Decoder: %s" % self.net)
-
-    def forward(self, x):
-        x = self.net(x)
-
-        return x
-
-
-class LossAccumulator(object):
-    def __init__(self, keys):
-        self.keys = keys
-        self.losses = {k: 0 for k in keys}
-        self.n = 0
-        self.results = []
-        pass
-
-    def update(self, losses):
-        for name, loss in losses:
-            self.losses[name] += loss
-        self.n += 1
-
-    def avg(self):
-        return {k: v.item() / self.n for k, v in self.losses.items()}
-
-    def avg_all(self):
-        return sum([v for k, v in self.avg().items()])
-
-    def reset(self):
-        self.losses = {k: 0 for k in self.keys}
-        self.n = 0
-
-    def get_result(self):
-        loss_results = self.avg()
-        loss_results["total"] = self.avg_all()
-        loss_results = {k: np.round(v, 3) for k, v in loss_results.items()}
-        return loss_results
-
-    def print(self, batch_num, no_batches, epoch):
-        print(f"Epoch {epoch}, [{batch_num}/{no_batches}] %s" % (self.get_result()))
-
-
-def train(loader, model, optimizer, loss_function, loss_acc, epoch):
-    loss_acc.reset()
-    for batch_num, inputs in enumerate(loader):
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        losses = loss_function(inputs, outputs)
-        loss = sum([x[1] for x in losses])
-
-        loss_acc.update(losses)
-
-        if not DEBUG_MODE:
-            loss.backward()
-            optimizer.step()
-    loss_acc.print(batch_num, len(loader), epoch)
-
-    return loss_acc.get_result()
-
-
-def validate(loader, model, optimizer, loss_function, loss_acc, epoch):
-    loss_acc.reset()
-    for batch_num, inputs in enumerate(loader):
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        losses = loss_function(inputs, outputs)
-
-        loss_acc.update(losses)
-
-    return loss_acc.get_result()
-
-
-def vae_loss(inputs, outputs):
-    x = inputs[0].cuda().float()
-    x_hat, z_mu, z_logvar = outputs
-
-    mse = F.mse_loss(x, x_hat, reduction="sum")
-    kl = -0.5 * torch.sum(1 + z_logvar - z_mu.pow(2) - z_logvar.exp())
-    return [("mse", mse), ("kl", kl)]
-
-
-def plot_losses(losses):
-    losses = pd.DataFrame(losses)
-    losses = losses.set_index("epoch")
-    losses.plot()
-    plt.legend(bbox_to_anchor=(1, 1), loc="upper left")
-    loss_plot_fp = "losses.png"
-    plt.savefig(loss_plot_fp, bbox_inches="tight")
-    plt.close()
 
 
 train_dataset, valid_dataset, weights, phyla_map = get_data(
@@ -351,57 +49,22 @@ valid_loader = torch.utils.data.DataLoader(
     valid_dataset, batch_size=BATCH_SIZE, shuffle=True
 )
 
-model = deepSequenceSimple(enable_bn=False, activation_function="ReLU")
+model = deepSequenceSimple(
+    enable_bn=False, activation_function="ReLU", gate_function="Softmax"
+)
 model = model.cuda()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, betas=[0.5, 0.999])  #
 loss_function = vae_loss
 loss_acc = LossAccumulator(keys=["mse", "kl"])
+
+
 losses = []
-
-
-def plot_latent(model, train_loader, valid_loader, best, epoch):
-    zs = []
-    for loader in [train_loader, valid_loader]:
-        for batch_num, inputs in enumerate(loader):
-            x, y = inputs
-            x_hat, z_mu, z_logvar = model(inputs)
-            z = model.reparameterize(z_mu, z_logvar).detach().cpu().numpy()
-
-            if not len(zs):
-                zs = z
-                ys = y.detach().cpu().numpy()
-            else:
-                zs = np.append(zs, z, axis=0)
-                ys = np.append(ys, y.detach().cpu().numpy(), axis=0)
-
-    if zs.shape[1] != 2:
-        tsne = TSNE(n_components=2, perplexity=20)
-        zs = tsne.fit_transform(zs)
-        print("latent dim not 2, using tsne")
-
-    df = pd.DataFrame(zs, columns=["x0", "x1"])
-    df["class"] = ys
-    df["class"] = df["class"].map(phyla_map)
-
-    df = df.sort_values("class")
-    fig_tsne = px.scatter(
-        df,
-        x="x0",
-        y="x1",
-        color="class",
-        opacity=0.5,
-        hover_data=["class"],
-    )
-    suffix = "_best" if best == True else ""
-    tsne_fp = os.path.join("plots", f"plotly_{epoch}{suffix}.html")
-
-    plotly.offline.plot(fig_tsne, filename=tsne_fp)
-
-
 best_val_loss = np.inf
 noImprovementSince = 0
 for epoch in range(MAX_NUM_EPOCHS):
-    train_losses = train(train_loader, model, optimizer, loss_function, loss_acc, epoch)
+    train_losses = train(
+        train_loader, model, optimizer, loss_function, loss_acc, epoch, DEBUG_MODE
+    )
     valid_losses = validate(
         valid_loader, model, optimizer, loss_function, loss_acc, epoch
     )
@@ -412,7 +75,7 @@ for epoch in range(MAX_NUM_EPOCHS):
     losses += [epoch_losses]
 
     if epoch % 20 == 0:
-        plot_latent(model, train_loader, valid_loader, False, epoch)
+        plot_latent(model, train_loader, valid_loader, False, epoch, phyla_map)
         print("plotted")
 
     plot_losses(losses)
@@ -431,3 +94,145 @@ for epoch in range(MAX_NUM_EPOCHS):
 
     if DEBUG_MODE:
         break
+
+
+def read_experimental_data(filename, measurement_col_name="2500", sequence_offset=0):
+    """Read experimental data from csv file, and check that amino acid match those
+    in the first sequence of the alignment.
+
+    measurement_col_name specifies which column in the csv file contains the experimental
+    observation. In our case, this is the one called 2500.
+
+    sequence_offset is used in case there is an overall offset between the
+    indices in the two files.
+    """
+
+    measurement_df = pd.read_csv(
+        filename, delimiter=",", usecols=["mutant", measurement_col_name]
+    )
+
+    zero_index = None
+
+    experimental_data = {}
+    for idx, entry in measurement_df.iterrows():
+        mutant_from, position, mutant_to = (
+            entry["mutant"][:1],
+            int(entry["mutant"][1:-1]),
+            entry["mutant"][-1:],
+        )
+
+        # Use index of first entry as offset (keep track of this in case
+        # there are index gaps in experimental data)
+        if zero_index is None:
+            zero_index = position
+
+        # Corresponding position in our alignment
+        seq_position = position - zero_index + sequence_offset
+
+        # Make sure that two two inputs agree on the indices: the
+        # amino acids in the first entry of the alignment should be
+        # identical to those in the experimental file.
+        # assert mutant_from == aa1[wt_sequence[seq_position]]
+
+        if seq_position not in experimental_data:
+            experimental_data[seq_position] = {}
+
+        # Check that there is only a single experimental value for mutant
+        assert mutant_to not in experimental_data[seq_position]
+
+        experimental_data[seq_position]["pos"] = seq_position
+        experimental_data[seq_position]["WT"] = mutant_from
+        experimental_data[seq_position][mutant_to] = entry[measurement_col_name]
+
+    experimental_data = (
+        pd.DataFrame(experimental_data).transpose().set_index(["pos", "WT"])
+    )
+    return experimental_data
+
+
+experimental_data = read_experimental_data("data/BLAT_ECOLX_Ranganathan2015.csv")
+experimental_data
+
+
+def approximate_log_ratios(
+    experimental_data, model, device, num_samples=10, model_type="vae"
+):
+
+    experimental_values = np.empty((263, 20))
+    approximate_vae_values = np.empty((263, 20))
+
+    # compute x_WT
+    x_WT = torch.empty(263)
+    for (position, mutant_from), _ in experimental_data.iterrows():
+        x_WT[position] = aa1_to_index[mutant_from]
+
+    x_WT_ = x_WT.clone()
+
+    # get output for x_WT
+    x_WT = x_WT[None, :]
+    if model_type == "iwae":
+        dim_0, dim_1 = x_WT.size()
+        x_WT = x_WT.expand(num_samples, dim_0, dim_1)
+    x_WT = x_WT.to(device)
+    if model_type == "vae":
+        x_WT = F.one_hot(x_WT.long())
+
+        # Add 0s for 3 classes that aren't included in experimental data
+        x_WT = F.pad(x_WT, pad=(0, 3)).float()
+        outputs = model([x_WT])
+        losses = loss_function([x_WT], outputs)
+        elbo_WT = sum([x[1] for x in losses])
+        # elbo_WT, _, _ = model.calculate_loss(x_WT, device=device)
+    else:
+        elbo_WT = model.calculate_loss(x_WT, beta=1.0, device=device)
+
+    # approximate log ratios
+    for (position, mutant_from), row in experimental_data.iterrows():
+        i = 0
+        for mutant_to, exp_value in row.iteritems():
+            if not np.isnan(exp_value):
+                # compute x_MT
+                x_MT = x_WT_.clone()
+
+                x_MT[position] = aa1_to_index[mutant_to]
+                # get output for x_MT
+                x_MT = x_MT[None, :]
+                x_MT = F.one_hot(x_MT.long())
+
+                # Add 0s for 3 classes that aren't included in experimental data
+                x_MT = F.pad(x_MT, pad=(0, 3)).float()
+                if model_type == "iwae":
+                    dim_0, dim_1 = x_MT.size()
+                    x_MT = x_MT.expand(num_samples, dim_0, dim_1)
+                x_MT = x_MT.to(device)
+                if model_type == "vae":
+                    outputs = model([x_MT])
+                    losses = loss_function([x_MT], outputs)
+                    elbo_MT = sum([x[1] for x in losses])
+                    # elbo_MT, _, _ = model.calculate_loss(x_MT, device=device)
+                else:
+                    wtf
+                    elbo_MT = model.calculate_loss(x_MT, beta=1.0, device=device)
+                # compute the approximate log-ratio
+                approx_log_ratio = np.log(
+                    elbo_MT.detach().cpu().numpy() / elbo_WT.detach().cpu().numpy()
+                )
+                # store values in numpy arrays
+                approximate_vae_values[position, i] = approx_log_ratio.item()
+                experimental_values[position, i] = exp_value
+
+            else:
+                approximate_vae_values[position, i] = 0.0
+                experimental_values[position, i] = np.nan
+            i += 1
+
+    # compute the Spearman R statistics
+    correlation, pvalue = spearmanr(
+        experimental_values.flatten(),
+        approximate_vae_values.flatten(),
+        nan_policy="omit",
+    )
+    return correlation, pvalue
+
+
+approximate_log_ratios(experimental_data, model, "cuda")
