@@ -3,7 +3,6 @@ data/
 repo/
 __pycache__/
 SFConfict
-*.ipynb
 .vscode/
 .ipynb_checkpoints/
 id_rsa
