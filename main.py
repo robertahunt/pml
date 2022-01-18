@@ -103,10 +103,11 @@ experiments = list(itertools.product(configs, list(range(n_experiments))))
 exp_no = 0
 results = {}
 for config, exp_id in experiments:
-    print("\n\nStarting exp_no {exp_no}/%s" % len(experiments))
+    print(f"\n\nStarting exp_no {exp_no}/%s" % len(experiments))
     print("\t with config %s" % config.dict)
+    exp_no += 1
 
-    folder = os.path.join("experiments", str(config.name) + "_" + str(exp_no))
+    folder = os.path.join("experiments", str(config.name) + "_" + str(exp_id))
     plots_folder = os.path.join(folder, "plots")
     checkpoints_folder = os.path.join(folder, "checkpoints")
     if os.path.exists(folder):
