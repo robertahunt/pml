@@ -26,7 +26,6 @@ class deepSequenceSimple(nn.Module):
         decoder_arch=[100, 500, 263 * 23],
         n_latent=2,
         activation_function="ReLU",
-        gate_function="Sigmoid",
         enable_bn=True,
     ):
 
@@ -46,13 +45,8 @@ class deepSequenceSimple(nn.Module):
             activation_function=activation_function,
         )
 
-        if gate_function == "Softmax":
-            self.gate_function = nn.Softmax(dim=2)
-        else:
-            exec(f"self.gate_function = nn.{gate_function}()")
-
-    def reparameterize(self, z_mu, z_logvar):
-        z_std = torch.exp(0.5 * z_logvar)
+    def reparameterize(self, z_mu, z_logsigma):
+        z_std = torch.exp(z_logsigma)
         eps_dist = torch.distributions.normal.Normal(0, 1)
         return z_mu + z_std * eps_dist.sample(z_mu.shape).cuda()
 
@@ -62,13 +56,22 @@ class deepSequenceSimple(nn.Module):
         batch_size = x.shape[0]
         x = x.view(batch_size, -1)
 
-        z_mu, z_logvar = self.encoder(x.cuda())
-        z = self.reparameterize(z_mu, z_logvar)
+        z_mu, z_logsigma = self.encoder(x.cuda())
+        z = self.reparameterize(z_mu, z_logsigma)
 
         x_hat = self.decoder(z)
         x_hat = x_hat.view(orig_shape)
-        x_hat = self.gate_function(x_hat)
-        return x_hat, z_mu, z_logvar
+        x_hat = F.log_softmax(x_hat, 2)
+
+        x = x.view(orig_shape)
+
+        logpx_z = (x * x_hat).view(batch_size, -1).sum(1)
+        return {
+            "x_hat": x_hat,
+            "logpx_z": logpx_z,
+            "z_mu": z_mu,
+            "z_logsigma": z_logsigma,
+        }
 
 
 class Encoder(nn.Module):
@@ -128,6 +131,11 @@ class Decoder(nn.Module):
             self.layers += [nn.Linear(in_features=_in, out_features=_out)]
 
         self.net = Sequential(*self.layers)
+        self.mu_l = nn.Parameter(torch.Tensor(1))
+        nn.init.ones_(self.mu_l)
+        self.logsigma_l = nn.Parameter(torch.Tensor(1))
+        nn.init.constant_(self.logsigma_l, -5)
+
         print("Initialized Decoder: %s" % self.net)
 
     def forward(self, x):

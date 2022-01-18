@@ -1,4 +1,3 @@
-from cgitb import enable
 import os
 import re
 import plotly
@@ -8,6 +7,8 @@ import plotly.express as px
 import matplotlib.pyplot as plt
 
 from Bio import SeqIO
+from tqdm import tqdm
+from cgitb import enable
 from sklearn.manifold import TSNE
 from sklearn.model_selection import train_test_split
 
@@ -65,7 +66,8 @@ def plot_latent(model, train_loader, valid_loader, best, epoch, phyla_map):
     for loader in [train_loader, valid_loader]:
         for batch_num, inputs in enumerate(loader):
             x, y = inputs
-            x_hat, z_mu, z_logvar = model(inputs)
+            outputs = model(inputs)
+            z_mu, z_logvar = outputs["z_mu"], outputs["z_logsigma"]
             z = model.reparameterize(z_mu, z_logvar).detach().cpu().numpy()
 
             if not len(zs):
@@ -118,19 +120,11 @@ def get_data(data_filename, calc_weights=False, weights_similarity_threshold=0.8
         if label not in phyla:
             label = "Other"
         labels.append(label)
-
-    seqs = F.one_hot(torch.from_numpy(np.vstack(seqs))).float()
+    seqs = torch.from_numpy(np.vstack(seqs).astype(np.float32))
 
     labels = np.array(labels)
 
     phyla_lookup_table, phyla_idx = np.unique(labels, return_inverse=True)
-    phyla_map = {k: v for k, v in zip(phyla_idx, labels)}
-
-    train_seqs, valid_seqs, train_phyla, valid_phyla = train_test_split(
-        seqs, torch.from_numpy(phyla_idx), train_size=0.7, stratify=phyla_idx
-    )
-    train_dataset = torch.utils.data.TensorDataset(*[train_seqs, train_phyla])
-    valid_dataset = torch.utils.data.TensorDataset(*[valid_seqs, valid_phyla])
 
     weights = None
     if calc_weights is not False:
@@ -138,14 +132,7 @@ def get_data(data_filename, calc_weights=False, weights_similarity_threshold=0.8
         # Experiencing memory issues on colab for this code because pytorch doesn't
         # allow one_hot directly to bool. Splitting in two and then merging.
         # one_hot = F.one_hot(seqs.long()).to('cuda' if torch.cuda.is_available() else 'cpu')
-        one_hot1 = F.one_hot(seqs[: len(seqs) // 2].long()).bool()
-        one_hot2 = F.one_hot(seqs[len(seqs) // 2 :].long()).bool()
-        one_hot = torch.cat([one_hot1, one_hot2]).to(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-        assert len(seqs) == len(one_hot)
-        del one_hot1
-        del one_hot2
+        one_hot = F.one_hot(seqs.long()).bool()
         one_hot[seqs > 19] = 0
         flat_one_hot = one_hot.flatten(1)
 
@@ -163,7 +150,7 @@ def get_data(data_filename, calc_weights=False, weights_similarity_threshold=0.8
             )
             w = (
                 1.0
-                / (similarities / lengths)
+                / (similarities.cuda() / lengths)
                 .gt(weights_similarity_threshold)
                 .sum(1)
                 .float()
@@ -173,7 +160,23 @@ def get_data(data_filename, calc_weights=False, weights_similarity_threshold=0.8
         weights = torch.cat(weights)
         neff = weights.sum()
 
-    return train_dataset, valid_dataset, weights, phyla_map
+    seqs = F.one_hot(seqs.long()).float()
+
+    (
+        train_seqs,
+        valid_seqs,
+        train_phyla,
+        valid_phyla,
+        weights_train,
+        weights_valid,
+    ) = train_test_split(
+        seqs, torch.from_numpy(phyla_idx), weights, train_size=0.7, stratify=phyla_idx
+    )
+    phyla_map = {k: v for k, v in zip(phyla_idx, labels)}
+    train_dataset = torch.utils.data.TensorDataset(*[train_seqs, train_phyla])
+    valid_dataset = torch.utils.data.TensorDataset(*[valid_seqs, valid_phyla])
+
+    return train_dataset, valid_dataset, weights_train, weights_valid, phyla_map
 
 
 class LossAccumulator(object):
@@ -186,11 +189,11 @@ class LossAccumulator(object):
 
     def update(self, losses, n):
         for name, loss in losses:
-            self.losses[name] += loss
+            self.losses[name] += loss.item() * n
         self.n += n
 
     def avg(self):
-        return {k: v.item() / self.n for k, v in self.losses.items()}
+        return {k: v / self.n for k, v in self.losses.items()}
 
     def avg_all(self):
         return sum([v for k, v in self.avg().items()])
@@ -210,6 +213,7 @@ class LossAccumulator(object):
 
 
 def train(loader, model, optimizer, loss_function, loss_acc, epoch, DEBUG_MODE):
+    model.train()
     loss_acc.reset()
     for batch_num, inputs in enumerate(loader):
         optimizer.zero_grad()
@@ -229,6 +233,7 @@ def train(loader, model, optimizer, loss_function, loss_acc, epoch, DEBUG_MODE):
 
 
 def validate(loader, model, optimizer, loss_function, loss_acc, epoch):
+    model.eval()
     loss_acc.reset()
     for batch_num, inputs in enumerate(loader):
         optimizer.zero_grad()
@@ -243,11 +248,37 @@ def validate(loader, model, optimizer, loss_function, loss_acc, epoch):
 
 def vae_loss(inputs, outputs):
     x = inputs[0].cuda().float()
-    x_hat, z_mu, z_logvar = outputs
+    x_hat, z_mu, z_logsigma, logpx_z = (
+        outputs["x_hat"],
+        outputs["z_mu"],
+        outputs["z_logsigma"],
+        outputs["logpx_z"],
+    )
 
-    mse = F.mse_loss(x, x_hat, reduction="sum")
-    kl = -0.5 * torch.sum(1 + z_logvar - z_mu.pow(2) - z_logvar.exp())
-    return [("mse", mse), ("kl", kl)]
+    # mse = F.mse_loss(x, x_hat, reduction="sum")
+    # logpxz = torch.sum(x * x_hat)
+    kl = -0.5 * torch.sum(
+        1.0 + 2.0 * z_logsigma - z_mu.pow(2) - torch.exp(2.0 * z_logsigma)
+    )
+    return [("mse", -logpx_z.mean()), ("kl", kl)]
+
+
+def ds_vae_loss(inputs, outputs):
+    x = inputs[0].cuda().float()
+    x_hat, z_mu, z_logsigma, logpx_z = (
+        outputs["x_hat"],
+        outputs["z_mu"],
+        outputs["z_logsigma"],
+        outputs["logpx_z"],
+    )
+
+    # mse = F.mse_loss(x, x_hat, reduction="sum")
+    # logpxz = torch.sum(x * x_hat)
+    # kl = -0.5 * torch.sum(1 + z_logvar - z_mu.pow(2) - z_logvar.exp())
+    kl = -0.5 * torch.sum(
+        1.0 + 2.0 * z_logsigma - z_mu.pow(2) - torch.exp(2.0 * z_logsigma), dim=1
+    )
+    return [("mse", -logpx_z.mean()), ("kl", kl.mean())]
 
 
 def plot_losses(losses):
@@ -258,3 +289,159 @@ def plot_losses(losses):
     loss_plot_fp = "losses.png"
     plt.savefig(loss_plot_fp, bbox_inches="tight")
     plt.close()
+
+
+def plot_correlations(cs):
+    cs = pd.DataFrame(cs, columns=["epoch", "correlation"])
+    cs = cs.set_index("epoch")
+    cs.plot()
+    plt.legend(bbox_to_anchor=(1, 1), loc="upper left")
+    cs_fp = "correlations.png"
+    plt.savefig(cs_fp, bbox_inches="tight")
+    plt.close()
+
+
+def read_experimental_data(filename, measurement_col_name="2500", sequence_offset=0):
+    """Read experimental data from csv file, and check that amino acid match those
+    in the first sequence of the alignment.
+
+    measurement_col_name specifies which column in the csv file contains the experimental
+    observation. In our case, this is the one called 2500.
+
+    sequence_offset is used in case there is an overall offset between the
+    indices in the two files.
+    """
+
+    measurement_df = pd.read_csv(
+        filename, delimiter=",", usecols=["mutant", measurement_col_name]
+    )
+
+    zero_index = None
+
+    experimental_data = {}
+    for idx, entry in measurement_df.iterrows():
+        mutant_from, position, mutant_to = (
+            entry["mutant"][:1],
+            int(entry["mutant"][1:-1]),
+            entry["mutant"][-1:],
+        )
+
+        # Use index of first entry as offset (keep track of this in case
+        # there are index gaps in experimental data)
+        if zero_index is None:
+            zero_index = position
+
+        # Corresponding position in our alignment
+        seq_position = position - zero_index + sequence_offset
+
+        # Make sure that two two inputs agree on the indices: the
+        # amino acids in the first entry of the alignment should be
+        # identical to those in the experimental file.
+        # assert mutant_from == aa1[wt_sequence[seq_position]]
+
+        if seq_position not in experimental_data:
+            experimental_data[seq_position] = {}
+
+        # Check that there is only a single experimental value for mutant
+        assert mutant_to not in experimental_data[seq_position]
+
+        experimental_data[seq_position]["pos"] = seq_position
+        experimental_data[seq_position]["WT"] = mutant_from
+        experimental_data[seq_position][mutant_to] = entry[measurement_col_name]
+
+    experimental_data = (
+        pd.DataFrame(experimental_data).transpose().set_index(["pos", "WT"])
+    )
+    return experimental_data
+
+
+def approximate_log_ratios(
+    experimental_data,
+    model,
+    loss_function,
+    device,
+    num_samples=10,
+    model_type="vae",
+    N_pred_iterations=30,
+):
+
+    experimental_values = np.empty((263, 20))
+    approximate_vae_values = np.empty((263, 20))
+
+    # compute x_WT
+    x_WT = torch.empty(263)
+    for (position, mutant_from), _ in experimental_data.iterrows():
+        x_WT[position] = aa1_to_index[mutant_from]
+
+    x_WT_ = x_WT.clone()
+
+    # get output for x_WT
+    x_WT = x_WT[None, :]
+    if model_type == "iwae":
+        dim_0, dim_1 = x_WT.size()
+        x_WT = x_WT.expand(num_samples, dim_0, dim_1)
+    x_WT = x_WT.to(device)
+    if model_type == "vae":
+        x_WT = F.one_hot(x_WT.long())
+
+        # Add 0s for 3 classes that aren't included in experimental data
+        x_WT = F.pad(x_WT, pad=(0, 3)).float()
+        WT_elbos = []
+        for h in range(N_pred_iterations):
+            outputs = model([x_WT])
+            losses = loss_function([x_WT], outputs)
+            WT_elbos += [sum([x[1] for x in losses]).detach().cpu().numpy()]
+        elbo_WT = -np.mean(WT_elbos)
+        # elbo_WT, _, _ = model.calculate_loss(x_WT, device=device)
+    else:
+        elbo_WT = model.calculate_loss(x_WT, beta=1.0, device=device)
+
+    # approximate log ratios
+    for (position, mutant_from), row in tqdm(
+        experimental_data.iterrows(), total=len(experimental_data)
+    ):
+        i = 0
+        for mutant_to, exp_value in row.iteritems():
+            if not np.isnan(exp_value):
+                # compute x_MT
+                x_MT = x_WT_.clone()
+
+                x_MT[position] = aa1_to_index[mutant_to]
+                # get output for x_MT
+                x_MT = x_MT[None, :]
+                x_MT = F.one_hot(x_MT.long())
+
+                # Add 0s for 3 classes that aren't included in experimental data
+                x_MT = F.pad(x_MT, pad=(0, 3)).float()
+                if model_type == "iwae":
+                    dim_0, dim_1 = x_MT.size()
+                    x_MT = x_MT.expand(num_samples, dim_0, dim_1)
+                x_MT = x_MT.to(device)
+                x_MT = x_MT.repeat(N_pred_iterations, 1, 1)
+                if model_type == "vae":
+                    outputs = model([x_MT])
+                    losses = loss_function([x_MT], outputs)
+                    elbo_MT = -sum([x[1] for x in losses]).detach().cpu().numpy()
+
+                else:
+                    wtf
+                    elbo_MT = model.calculate_loss(x_MT, beta=1.0, device=device)
+                # compute the approximate log-ratio
+                approx_log_ratio = elbo_MT - elbo_WT
+
+                # store values in numpy arrays
+                approximate_vae_values[position, i] = approx_log_ratio
+                experimental_values[position, i] = exp_value
+
+            else:
+                approximate_vae_values[position, i] = 0.0
+                experimental_values[position, i] = np.nan
+            i += 1
+
+    # compute the Spearman R statistics
+    correlation, pvalue = spearmanr(
+        experimental_values.flatten(),
+        approximate_vae_values.flatten(),
+        nan_policy="omit",
+    )
+    return experimental_values, approximate_vae_values, correlation, pvalue
