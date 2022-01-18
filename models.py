@@ -17,13 +17,14 @@ import torch.nn.functional as F
 from torch.nn import Sequential
 
 from scipy.stats import spearmanr
+from prettytable import PrettyTable
 
 
 class deepSequenceSimple(nn.Module):
     def __init__(
         self,
         encoder_arch=[263 * 23, 1500, 1500],
-        decoder_arch=[100, 500, 263 * 23],
+        decoder_arch=[100, 2000, 263 * 23],
         n_latent=2,
         activation_function="ReLU",
         enable_bn=True,
@@ -44,6 +45,32 @@ class deepSequenceSimple(nn.Module):
             enable_bn=enable_bn,
             activation_function=activation_function,
         )
+
+    # code used from https://stackoverflow.com/questions/49201236/check-the-total-number-of-parameters-in-a-pytorch-model
+    def count_parameters(self):
+        table = PrettyTable(["Modules", "Parameters"])
+        total_params = 0
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            param = parameter.numel()
+            table.add_row([name, param])
+            total_params += param
+        print(table)
+        print(f"Total Trainable Params: {total_params}")
+        return total_params
+
+    def save_parameters(self, folder):
+        total_params = 0
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            param = parameter.numel()
+            total_params += param
+
+        fp = os.path.join(folder, "no_parameters.txt")
+        with open(fp, "w") as f:
+            f.write(str(total_params))
 
     def reparameterize(self, z_mu, z_logsigma):
         z_std = torch.exp(z_logsigma)
@@ -131,10 +158,6 @@ class Decoder(nn.Module):
             self.layers += [nn.Linear(in_features=_in, out_features=_out)]
 
         self.net = Sequential(*self.layers)
-        self.mu_l = nn.Parameter(torch.Tensor(1))
-        nn.init.ones_(self.mu_l)
-        self.logsigma_l = nn.Parameter(torch.Tensor(1))
-        nn.init.constant_(self.logsigma_l, -5)
 
         print("Initialized Decoder: %s" % self.net)
 

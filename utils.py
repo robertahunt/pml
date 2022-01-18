@@ -260,7 +260,7 @@ def vae_loss(inputs, outputs):
     kl = -0.5 * torch.sum(
         1.0 + 2.0 * z_logsigma - z_mu.pow(2) - torch.exp(2.0 * z_logsigma)
     )
-    return [("mse", -logpx_z.mean()), ("kl", kl)]
+    return [("logpx_z", -logpx_z.mean()), ("kl", kl)]
 
 
 def ds_vae_loss(inputs, outputs):
@@ -278,27 +278,31 @@ def ds_vae_loss(inputs, outputs):
     kl = -0.5 * torch.sum(
         1.0 + 2.0 * z_logsigma - z_mu.pow(2) - torch.exp(2.0 * z_logsigma), dim=1
     )
-    return [("mse", -logpx_z.mean()), ("kl", kl.mean())]
+    return [("logpx_z", -logpx_z.mean()), ("kl", kl.mean())]
 
 
-def plot_losses(losses):
+def save_losses(losses, folder):
     losses = pd.DataFrame(losses)
     losses = losses.set_index("epoch")
     losses.plot()
     plt.legend(bbox_to_anchor=(1, 1), loc="upper left")
-    loss_plot_fp = "losses.png"
+    loss_plot_fp = os.path.join(folder, "plots", "losses.png")
+    loss_csv_fp = os.path.join(folder, "losses.csv")
     plt.savefig(loss_plot_fp, bbox_inches="tight")
     plt.close()
+    losses.to_csv(loss_csv_fp)
 
 
-def plot_correlations(cs):
+def save_correlations(cs, folder):
     cs = pd.DataFrame(cs, columns=["epoch", "correlation"])
     cs = cs.set_index("epoch")
     cs.plot()
     plt.legend(bbox_to_anchor=(1, 1), loc="upper left")
-    cs_fp = "correlations.png"
-    plt.savefig(cs_fp, bbox_inches="tight")
+    cs_plot_fp = os.path.join(folder, "plots", "correlations.png")
+    cs_csv_fp = os.path.join(folder, "correlations.csv")
+    plt.savefig(cs_plot_fp, bbox_inches="tight")
     plt.close()
+    cs.to_csv(cs_csv_fp)
 
 
 def read_experimental_data(filename, measurement_col_name="2500", sequence_offset=0):
@@ -445,3 +449,28 @@ def approximate_log_ratios(
         nan_policy="omit",
     )
     return experimental_values, approximate_vae_values, correlation, pvalue
+
+
+def save_checkpoint(folder, fn, model, optimizer, results):
+    fp = os.path.join(folder, fn)
+
+    state = {
+        "state_dict": model.state_dict(),
+        "optimizer_dict": optimizer.state_dict(),
+        "results_dict": results,
+    }
+
+    torch.save(state, fp)
+
+
+def load_checkpoint(folder, fn, model, optimizer):
+    fp = os.path.join(folder, fn)
+    state = torch.load(fp)
+    model.load_state_dict(state["state_dict"])
+    try:
+        optimizer.load_state_dict(state["optimizer_dict"])
+    except:
+        print("Could not load optimizer state dictionary. ")
+
+    results = state["results_dict"]
+    return model, optimizer, results
