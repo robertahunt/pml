@@ -1,4 +1,3 @@
-experiments/
 data/
 repo/
 __pycache__/
@@ -14,4 +13,6 @@ imagenet-autoencoder/
 main_2.py 
 main_old.py 
 d2l_test.py
-
+DeepSequence-PyTorch/
+options.py
+.pth.tar

@@ -78,19 +78,22 @@ class Config(object):
 
 
 base_config = Config()
-bnorm_config = Config(name="bnorm", batch_norm=True)
-ls10_config = Config(name="ls10", n_latent=10)
-ls50_config = Config(name="ls50", n_latent=50)
-ls100_config = Config(name="ls100", n_latent=100)
+weighted_config = Config(name="weighted", use_weighted_sampler=True)
+bnorm_config = Config(name="bnorm", batch_norm=True, use_weighted_sampler=True)
+ls10_config = Config(name="ls10", n_latent=10, use_weighted_sampler=True)
+ls50_config = Config(name="ls50", n_latent=50, use_weighted_sampler=True)
+ls100_config = Config(name="ls100", n_latent=100, use_weighted_sampler=True)
 p = 225
 deepnar_config = Config(
     name="deepnar",
     encoder_arch=[263 * 23, p * 8, p * 2, p],
     decoder_arch=[p, p * 2, p * 8, 263 * 23],
+    use_weighted_sampler=True,
 )
 
 configs = [
     base_config,
+    weighted_config,
     bnorm_config,
     ls10_config,
     ls50_config,
