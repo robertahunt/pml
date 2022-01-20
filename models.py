@@ -109,6 +109,7 @@ class deepSequenceSimple(nn.Module):
 
         else:
             # calculate q(z|x)
+            x_hat = torch.sigmoid(x_hat)
             z_std = torch.exp(z_logsigma)
             qzGx = td.Normal(z_mu, z_std)
             log_qzGx = qzGx.log_prob(z)
