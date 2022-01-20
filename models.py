@@ -14,6 +14,7 @@ from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributions as td
 from torch.nn import Sequential
 
 from scipy.stats import spearmanr
@@ -27,7 +28,8 @@ class deepSequenceSimple(nn.Module):
         decoder_arch=[100, 2000, 263 * 23],
         n_latent=2,
         activation_function="ReLU",
-        enable_bn=True,
+        enable_bn=False,
+        iwae=False,
     ):
 
         super(deepSequenceSimple, self).__init__()
@@ -45,6 +47,10 @@ class deepSequenceSimple(nn.Module):
             enable_bn=enable_bn,
             activation_function=activation_function,
         )
+        self.iwae = iwae
+        self.n_latent = n_latent
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.softmax = nn.Softmax(dim=2)
 
     # code used from https://stackoverflow.com/questions/49201236/check-the-total-number-of-parameters-in-a-pytorch-model
     def count_parameters(self):
@@ -77,7 +83,7 @@ class deepSequenceSimple(nn.Module):
         eps_dist = torch.distributions.normal.Normal(0, 1)
         return z_mu + z_std * eps_dist.sample(z_mu.shape).cuda()
 
-    def forward(self, inputs):
+    def forward(self, inputs, beta=1):
         x = inputs[0].cuda()
         orig_shape = x.shape
         batch_size = x.shape[0]
@@ -88,17 +94,47 @@ class deepSequenceSimple(nn.Module):
 
         x_hat = self.decoder(z)
         x_hat = x_hat.view(orig_shape)
-        x_hat = F.log_softmax(x_hat, 2)
-
         x = x.view(orig_shape)
+        if not self.iwae:
+            x_hat = F.log_softmax(x_hat, 2)
 
-        logpx_z = (x * x_hat).view(batch_size, -1).sum(1)
-        return {
-            "x_hat": x_hat,
-            "logpx_z": logpx_z,
-            "z_mu": z_mu,
-            "z_logsigma": z_logsigma,
-        }
+            logpx_z = (x * x_hat).view(batch_size, -1).sum(1)
+            x_hat = torch.exp(x_hat)
+            return {
+                "x_hat": x_hat,
+                "logpx_z": logpx_z,
+                "z_mu": z_mu,
+                "z_logsigma": z_logsigma,
+            }
+
+        else:
+            # calculate q(z|x)
+            z_std = torch.exp(z_logsigma)
+            qzGx = td.Normal(z_mu, z_std)
+            log_qzGx = qzGx.log_prob(z)
+            log_qzGx = torch.sum(log_qzGx, dim=-1)
+            # calculate p(x)
+            z_mu_prior = torch.zeros(self.n_latent).to(self.device)
+            z_logsigma_prior = torch.ones(self.n_latent).to(self.device)
+            pz = td.Normal(loc=z_mu_prior, scale=z_logsigma_prior)
+            log_pz = torch.sum(pz.log_prob(z))
+            # calculate p(x|z)
+            x_hat = torch.sigmoid(x_hat)
+            x_categories = x.argmax(-1)  # convert from one-hot encoding back
+            pxGz = td.categorical.Categorical(logits=x_hat).log_prob(x_categories)
+            log_pxGz = torch.sum(pxGz, dim=-1)
+            # x_hat = F.log_softmax(x_hat, 2)
+            # log_pxGz = (x * x_hat).view(batch_size, -1).sum(1)
+            # x_hat = torch.exp(x_hat)
+
+            return {
+                "x_hat": x_hat,
+                "z_mu": z_mu,
+                "z_logsigma": z_logsigma,
+                "log_pxGz": log_pxGz,
+                "log_pz": log_pz,
+                "log_qzGx": log_qzGx,
+            }
 
 
 class Encoder(nn.Module):

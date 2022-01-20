@@ -35,6 +35,7 @@ from utils import (
     approximate_log_ratios,
     save_correlations,
     ds_vae_loss,
+    iwae_loss,
     load_checkpoint,
     save_checkpoint,
 )
@@ -64,6 +65,7 @@ class Config(object):
         use_weighted_sampler=False,
         batch_norm=False,
         activation_function="ReLU",
+        iwae=False,
     ):
         # set it up so each input to the class is saved as self.{input}
         # ie self.latent
@@ -90,16 +92,12 @@ deepnar_config = Config(
     decoder_arch=[p, p * 2, p * 8, 263 * 23],
     use_weighted_sampler=True,
 )
+test_config = Config(name="test", use_weighted_sampler=True)
+iwae_config = Config(
+    name="iwae", use_weighted_sampler=True, iwae=True, lr=1e-3, early_stopping=100
+)
 
-configs = [
-    base_config,
-    weighted_config,
-    bnorm_config,
-    ls10_config,
-    ls50_config,
-    ls100_config,
-    deepnar_config,
-]
+configs = [iwae_config]  # ,
 n_experiments = 3
 
 experiments = list(itertools.product(configs, list(range(n_experiments))))
@@ -161,13 +159,18 @@ for config, exp_id in experiments:
         n_latent=config.n_latent,
         enable_bn=config.batch_norm,
         activation_function=config.activation_function,
+        iwae=config.iwae,
     )
     model.count_parameters()
     model.save_parameters(folder)
     model = model.cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)  #
-    loss_function = ds_vae_loss
-    loss_acc = LossAccumulator(keys=["logpx_z", "kl"])
+    if config.iwae:
+        loss_function = iwae_loss
+        loss_acc = LossAccumulator(keys=["iwae"])
+    else:
+        loss_function = ds_vae_loss
+        loss_acc = LossAccumulator(keys=["logpx_z", "kl"])
 
     experimental_data = read_experimental_data("data/BLAT_ECOLX_Ranganathan2015.csv")
 
@@ -175,8 +178,9 @@ for config, exp_id in experiments:
     correlations = []
     best_val_loss = np.inf
     noImprovementSince = 0
+    beta = 0
     for epoch in range(config.max_num_epochs):
-        train_losses = train(
+        train_losses, beta = train(
             train_loader,
             model,
             optimizer,
@@ -184,10 +188,11 @@ for config, exp_id in experiments:
             loss_acc,
             epoch,
             config.debug_mode,
+            beta,
         )
 
         valid_losses = validate(
-            valid_loader, model, optimizer, loss_function, loss_acc, epoch
+            valid_loader, model, optimizer, loss_function, loss_acc, epoch, beta
         )
 
         epoch_losses = {"train_" + k: v for k, v in train_losses.items()}
@@ -197,7 +202,15 @@ for config, exp_id in experiments:
 
         if config.plot_latent:
             if epoch % 20 == 0:
-                plot_latent(model, train_loader, valid_loader, False, epoch, phyla_map)
+                plot_latent(
+                    model,
+                    train_loader,
+                    valid_loader,
+                    False,
+                    epoch,
+                    phyla_map,
+                    plots_folder,
+                )
                 print("plotted")
 
         save_losses(losses, folder)
@@ -230,7 +243,15 @@ for config, exp_id in experiments:
                 checkpoints_folder, "best.pth.tar", model, optimizer
             )
             if config.plot_latent:
-                plot_latent(model, train_loader, valid_loader, True, epoch, phyla_map)
+                plot_latent(
+                    model,
+                    train_loader,
+                    valid_loader,
+                    True,
+                    epoch,
+                    phyla_map,
+                    plots_folder,
+                )
             break
 
         if config.debug_mode:

@@ -61,7 +61,9 @@ phyla = [
 ]
 
 
-def plot_latent(model, train_loader, valid_loader, best, epoch, phyla_map):
+def plot_latent(
+    model, train_loader, valid_loader, best, epoch, phyla_map, plots_folder
+):
     zs = []
     for loader in [train_loader, valid_loader]:
         for batch_num, inputs in enumerate(loader):
@@ -96,7 +98,7 @@ def plot_latent(model, train_loader, valid_loader, best, epoch, phyla_map):
         hover_data=["class"],
     )
     suffix = "_best" if best == True else ""
-    tsne_fp = os.path.join("plots", f"plotly_{epoch}{suffix}.html")
+    tsne_fp = os.path.join(plots_folder, f"plotly_{epoch}{suffix}.html")
 
     plotly.offline.plot(fig_tsne, filename=tsne_fp)
 
@@ -208,17 +210,20 @@ class LossAccumulator(object):
         loss_results = {k: np.round(v, 3) for k, v in loss_results.items()}
         return loss_results
 
-    def print(self, batch_num, no_batches, epoch):
-        print(f"Epoch {epoch}, [{batch_num}/{no_batches}] %s" % (self.get_result()))
+    def print(self, batch_num, no_batches, epoch, beta=0):
+        print(
+            f"Epoch {epoch}, [{batch_num}/{no_batches}] %s, beta %s"
+            % (self.get_result(), np.round(beta, 3))
+        )
 
 
-def train(loader, model, optimizer, loss_function, loss_acc, epoch, DEBUG_MODE):
+def train(loader, model, optimizer, loss_function, loss_acc, epoch, DEBUG_MODE, beta):
     model.train()
     loss_acc.reset()
     for batch_num, inputs in enumerate(loader):
         optimizer.zero_grad()
         outputs = model(inputs)
-        losses = loss_function(inputs, outputs)
+        losses = loss_function(inputs, outputs, beta=beta)
         loss = sum([x[1] for x in losses])
 
         batch_size = inputs[0].shape[0]
@@ -227,18 +232,20 @@ def train(loader, model, optimizer, loss_function, loss_acc, epoch, DEBUG_MODE):
         if not DEBUG_MODE:
             loss.backward()
             optimizer.step()
-    loss_acc.print(batch_num, len(loader), epoch)
+        if beta < 1:
+            beta += 0.001
+    loss_acc.print(batch_num, len(loader), epoch, beta)
 
-    return loss_acc.get_result()
+    return loss_acc.get_result(), beta
 
 
-def validate(loader, model, optimizer, loss_function, loss_acc, epoch):
+def validate(loader, model, optimizer, loss_function, loss_acc, epoch, beta):
     model.eval()
     loss_acc.reset()
     for batch_num, inputs in enumerate(loader):
         optimizer.zero_grad()
         outputs = model(inputs)
-        losses = loss_function(inputs, outputs)
+        losses = loss_function(inputs, outputs, beta=beta)
 
         batch_size = inputs[0].shape[0]
         loss_acc.update(losses, batch_size)
@@ -246,7 +253,7 @@ def validate(loader, model, optimizer, loss_function, loss_acc, epoch):
     return loss_acc.get_result()
 
 
-def vae_loss(inputs, outputs):
+def vae_loss(inputs, outputs, **kwargs):
     x = inputs[0].cuda().float()
     x_hat, z_mu, z_logsigma, logpx_z = (
         outputs["x_hat"],
@@ -263,7 +270,7 @@ def vae_loss(inputs, outputs):
     return [("logpx_z", -logpx_z.mean()), ("kl", kl)]
 
 
-def ds_vae_loss(inputs, outputs):
+def ds_vae_loss(inputs, outputs, **kwargs):
     x = inputs[0].cuda().float()
     x_hat, z_mu, z_logsigma, logpx_z = (
         outputs["x_hat"],
@@ -279,6 +286,18 @@ def ds_vae_loss(inputs, outputs):
         1.0 + 2.0 * z_logsigma - z_mu.pow(2) - torch.exp(2.0 * z_logsigma), dim=1
     )
     return [("logpx_z", -logpx_z.mean()), ("kl", kl.mean())]
+
+
+def iwae_loss(inputs, outputs, beta=1):
+    log_pxGz, log_pz, log_qzGx = (
+        outputs["log_pxGz"],
+        outputs["log_pz"],
+        outputs["log_qzGx"],
+    )
+    w = log_pxGz + (log_pz - log_qzGx) * beta
+    loss = -torch.mean(torch.logsumexp(w, 0))
+
+    return [("iwae", loss)]
 
 
 def save_losses(losses, folder):

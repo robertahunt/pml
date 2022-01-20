@@ -15,4 +15,5 @@ main_old.py
 d2l_test.py
 DeepSequence-PyTorch/
 options.py
-.pth.tar
+*.pth.tar
+*.html
